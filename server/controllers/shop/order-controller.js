@@ -1,7 +1,8 @@
-const paypal = require("../../helpers/paypal");
+
+const Product = require("../../models/Product");
+const paystack = require("../../helpers/paystack");
 const Order = require("../../models/Order");
 const Cart = require("../../models/Cart");
-const Product = require("../../models/Product");
 
 const createOrder = async (req, res) => {
   try {
@@ -15,121 +16,99 @@ const createOrder = async (req, res) => {
       totalAmount,
       orderDate,
       orderUpdateDate,
-      paymentId,
-      payerId,
       cartId,
     } = req.body;
 
-    const create_payment_json = {
-      intent: "sale",
-      payer: {
-        payment_method: "paypal",
-      },
-      redirect_urls: {
-        return_url: "http://localhost:5173/shop/paypal-return",
-        cancel_url: "http://localhost:5173/shop/paypal-cancel",
-      },
-      transactions: [
-        {
-          item_list: {
-            items: cartItems.map((item) => ({
-              name: item.title,
-              sku: item.productId,
-              price: item.price.toFixed(2),
-              currency: "USD",
-              quantity: item.quantity,
-            })),
-          },
-          amount: {
-            currency: "USD",
-            total: totalAmount.toFixed(2),
-          },
-          description: "description",
-        },
-      ],
-    };
-
-    paypal.payment.create(create_payment_json, async (error, paymentInfo) => {
-      if (error) {
-        console.log(error);
-
-        return res.status(500).json({
-          success: false,
-          message: "Error while creating paypal payment",
-        });
-      } else {
-        const newlyCreatedOrder = new Order({
-          userId,
-          cartId,
-          cartItems,
-          addressInfo,
-          orderStatus,
-          paymentMethod,
-          paymentStatus,
-          totalAmount,
-          orderDate,
-          orderUpdateDate,
-          paymentId,
-          payerId,
-        });
-
-        await newlyCreatedOrder.save();
-
-        const approvalURL = paymentInfo.links.find(
-          (link) => link.rel === "approval_url"
-        ).href;
-
-        res.status(201).json({
-          success: true,
-          approvalURL,
-          orderId: newlyCreatedOrder._id,
-        });
-      }
+    // Create new order (pending payment)
+    const newOrder = new Order({
+      userId,
+      cartId,
+      cartItems,
+      addressInfo,
+      orderStatus: "pending",
+      paymentMethod: "paystack",
+      paymentStatus: "pending",
+      totalAmount,
+      orderDate,
+      orderUpdateDate,
     });
+
+    await newOrder.save();
+
+    // Create Paystack payment request
+    const paystackResponse = await paystack.post("/transaction/initialize", {
+      email: req.body.email, // User email required by Paystack
+      amount: totalAmount * 100, // Paystack expects amount in kobo (1 Naira = 100 kobo)
+      currency: "GHS",
+      callback_url: `http://localhost:5173/shop/paystack-return?orderId=${newOrder._id}`,
+    });
+
+    if (!paystackResponse.data.status) {
+      return res.status(500).json({
+        success: false,
+        message: "Error while creating Paystack payment",
+      });
+    }
+
+    res.status(201).json({
+      success: true,
+      paymentURL: paystackResponse.data.data.authorization_url,
+      orderId: newOrder._id,
+    });
+
+    console.log(paystackResponse.data.data.authorization_url,)
   } catch (e) {
     console.log(e);
-    res.status(500).json({
-      success: false,
-      message: "Some error occured!",
-    });
+    res.status(500).json({ success: false, message: "Some error occurred!" });
   }
 };
 
+
 const capturePayment = async (req, res) => {
   try {
-    const { paymentId, payerId, orderId } = req.body;
+    const { reference, orderId } = req.body;
 
     let order = await Order.findById(orderId);
 
     if (!order) {
       return res.status(404).json({
         success: false,
-        message: "Order can not be found",
+        message: "Order not found",
       });
     }
 
+    // Verify payment from Paystack
+    const paystackResponse = await paystack.get(`/transaction/verify/${reference}`);
+
+    if (!paystackResponse.data.status || paystackResponse.data.data.status !== "success") {
+      return res.status(400).json({
+        success: false,
+        message: "Payment verification failed",
+      });
+    }
+
+    // Update order status
     order.paymentStatus = "paid";
     order.orderStatus = "confirmed";
-    order.paymentId = paymentId;
-    order.payerId = payerId;
+    order.paymentId = paystackResponse.data.data.id;
 
+    // Reduce stock for each product
     for (let item of order.cartItems) {
       let product = await Product.findById(item.productId);
 
       if (!product) {
         return res.status(404).json({
           success: false,
-          message: `Not enough stock for this product ${product.title}`,
+          message: `Not enough stock for product ${item.title}`,
         });
       }
 
       product.totalStock -= item.quantity;
-
       await product.save();
     }
 
-    const getCartId = order.cartId;
-    await Cart.findByIdAndDelete(getCartId);
+    // Delete cart after successful payment
+    await Cart.findByIdAndDelete(order.cartId);
 
     await order.save();
 
@@ -140,12 +119,10 @@ const capturePayment = async (req, res) => {
     });
   } catch (e) {
     console.log(e);
-    res.status(500).json({
-      success: false,
-      message: "Some error occured!",
-    });
+    res.status(500).json({ success: false, message: "Some error occurred!" });
   }
 };
+
 
 const getAllOrdersByUser = async (req, res) => {
   try {
